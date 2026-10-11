@@ -141,15 +141,24 @@
   </div>
 </main>
 
-<script>
+<script type="module">
+import { Connection, PublicKey } from 'https://esm.sh/@solana/web3.js@1.98.4';
+import { getTokenMetadata, TOKEN_2022_PROGRAM_ID } from 'https://esm.sh/@solana/spl-token@0.4.15';
+
 const WALLET        = "CLTycZtfAzkyVb2YZY5ySKtQoJo89tHoEM1T6LaCveM4";
-const TOKEN_2022    = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
-// Helius access now goes through a server-side proxy
-// (netlify/functions/helius-proxy.js) - the API key never reaches the
-// browser. See that file for the HELIUS_API_KEY environment variable it
-// reads.
+const TOKEN_2022    = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"; // string form - used by the raw JSON-RPC calls below
+// Helius access goes through a server-side proxy (netlify/functions/
+// helius-proxy.js) - the API key never reaches the browser. See that file
+// for the HELIUS_API_KEY environment variable it reads. This Connection
+// object works transparently against the proxy since it's a pure pass-
+// through to Helius's real JSON-RPC endpoint - same request/response shape.
 const RPC          = "/.netlify/functions/helius-proxy?kind=rpc";
 const HELIUS_PARSE = "/.netlify/functions/helius-proxy?kind=parse";
+
+// Real connection object (web3.js), used only for getTokenMetadata below -
+// everything else still goes through the existing hand-rolled rpcPost()
+// JSON-RPC helper, untouched.
+const connection = new Connection(RPC, 'confirmed');
 
 let allTokens = [];
 let logs = [];
@@ -179,63 +188,53 @@ async function rpcPost(body) {
   return d.result;
 }
 
-// ── Decode metadata from raw base64 mint account ──
-function scanStrings(buf) {
-  const found = [];
-  for (let i = 0; i < buf.length - 4; i++) {
-    const len = buf[i]|(buf[i+1]<<8)|(buf[i+2]<<16)|(buf[i+3]<<24);
-    if (len >= 1 && len <= 500 && i+4+len <= buf.length) {
-      let ok = true;
-      for (let j=i+4; j<i+4+len; j++) { if (buf[j]<0x20||buf[j]>0x7E){ok=false;break;} }
-      if (ok) found.push({offset:i, str: new TextDecoder().decode(buf.slice(i+4,i+4+len))});
-    }
-  }
-  return found;
-}
-function decodeMetadata(b64) {
-  try {
-    const bin = atob(b64);
-    const buf = new Uint8Array(bin.length);
-    for (let i=0;i<bin.length;i++) buf[i]=bin.charCodeAt(i);
-    const strings = scanStrings(buf);
-    const meta = {};
-    const symIdx = strings.findIndex(s => s.str === "item");
-    if (symIdx >= 0) {
-      meta.symbol = "item";
-      if (symIdx > 0) meta.name = strings[symIdx-1].str;
-      let i = symIdx + 1;
-      if (strings[i]?.str.startsWith("http")) i++; // skip uri
-      while (i < strings.length - 1) {
-        const key = strings[i].str.toLowerCase().trim();
-        const val = strings[i+1]?.str;
-        if (!val) { i++; continue; }
-        if      (key==="what")                        { meta.item=val; i+=2; }
-        else if (key==="where")                        { meta.location=val; i+=2; }
-        else if (key==="whatprice"||key==="price")    { meta.price=val; i+=2; }
-        else if (key==="who"||key==="business")        { meta.business=val; i+=2; }
-        else if (key==="website"||key==="url")        { meta.website=val; i+=2; }
-        else if (key.length<=24&&!/^http/.test(key))  { meta[key]=val; i+=2; }
-        else i++;
-      }
-    }
-    return meta;
-  } catch(e) { return {_err:e.message}; }
-}
-
-// ── Fetch mint account and decode ──
+// ── Fetch + decode a mint's real on-chain Token-2022 metadata ──
+// Replaces the old scanStrings()/decodeMetadata() raw-byte heuristic (it
+// guessed field boundaries by scanning for anything that merely looked like
+// a length-prefixed ASCII string, which misaligned whenever other binary
+// extension data coincidentally matched that same shape - that's what
+// produced garbled rows like "Item: where" / "price: whatprice"). This uses
+// the real Token-2022 TLV + Borsh deserializer instead, so there's nothing
+// left to misalign.
 async function fetchAndDecode(mintAddr) {
   try {
-    const result = await rpcPost({
-      jsonrpc:"2.0", id:1,
-      method:"getAccountInfo",
-      params:[mintAddr, {encoding:"base64"}]
-    });
-    const b64 = result?.value?.data?.[0];
-    if (!b64) return null;
-    const meta = decodeMetadata(b64);
-    if (!meta.symbol && !meta.name) return null;
+    const metadata = await getTokenMetadata(connection, new PublicKey(mintAddr), 'confirmed', TOKEN_2022_PROGRAM_ID);
+    if (!metadata || metadata.symbol !== "item") return null;
+
+    const meta = { symbol: metadata.symbol, name: metadata.name, uri: metadata.uri };
+    for (const [rawKey, val] of metadata.additionalMetadata) {
+      const key = (rawKey || "").toLowerCase().trim();
+      if (!val) continue;
+      if      (key === "what")                        meta.item = val;
+      else if (key === "where")                        meta.location = val;
+      else if (key === "whatprice" || key === "price") meta.price = val;
+      else if (key === "who" || key === "business")    meta.business = val;
+      else if (key === "website" || key === "url")     meta.website = val;
+      else if (key.length <= 24)                       meta[key] = val;
+    }
+
+    // Launch requirement (2026-10-10): only a complete listing counts - all
+    // three required fields (item, location, price) must actually be on
+    // chain, or this token is left out of the explorer entirely. This
+    // catches early test mints created with incomplete details.
+    if (!meta.item || !meta.location || !meta.price) return null;
+
+    // Some earlier test mints DO have all three fields filled in, just with
+    // placeholder values ("Test Location", item names like "Stripe E2E Test"
+    // or "Promo Apply Test Item") - a whole-word match on "test" in either
+    // the item name or location catches these without false-positiving on a
+    // real item that happens to contain "latest"/"contest"/etc.
+    const looksLikeTest = /\btest\b/i.test(meta.item) || /\btest\b/i.test(meta.location);
+    if (looksLikeTest) return null;
+
+    // Excluded by request: Guatemala/Nigeria listings.
+    const excludedLocation = /guatemala|nigeria/i.test(meta.location);
+    if (excludedLocation) return null;
+
     return { address: mintAddr, ...meta };
-  } catch(e) { return null; }
+  } catch (e) {
+    return null;
+  }
 }
 
 // ── Fetch in batches to avoid rate limits ──
@@ -285,7 +284,8 @@ async function startScan() {
     for (let ci=0; ci<sigChunks.length; ci++) {
       setProgress(`Scanning transactions for mint events...`, `Batch ${ci+1}/${sigChunks.length}`);
       try {
-        // Use Helius parseTransactions endpoint
+        // Use Helius parseTransactions endpoint, via the server-side proxy -
+        // see the matching comment on RPC/HELIUS_PARSE above.
         const r = await fetch(
           HELIUS_PARSE,
           {
@@ -433,6 +433,11 @@ function filterTokens() {
       </div>`;
   }).join("");
 }
+
+// Needed since these are only called from inline onclick/oninput HTML
+// attributes, which can't see a module script's top-level scope otherwise.
+window.startScan = startScan;
+window.filterTokens = filterTokens;
 </script>
 
 </body>
