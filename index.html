@@ -164,8 +164,12 @@ const HELIUS_PARSE = "/.netlify/functions/helius-proxy?kind=parse";
 
 // Real connection object (web3.js), used only for getTokenMetadata below -
 // everything else still goes through the existing hand-rolled rpcPost()
-// JSON-RPC helper, untouched.
-const connection = new Connection(RPC, 'confirmed');
+// JSON-RPC helper, untouched. Connection (unlike plain fetch()) rejects a
+// relative URL outright ("Endpoint URL must start with http: or https:"),
+// thrown synchronously right here at module-load time - which is exactly
+// why the page did nothing at all when the button was clicked: this line
+// never got past construction, so window.startScan was never assigned.
+const connection = new Connection(new URL(RPC, window.location.origin).toString(), 'confirmed');
 
 let allTokens = [];
 let logs = [];
