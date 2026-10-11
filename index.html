@@ -143,7 +143,14 @@
 
 <script type="module">
 import { Connection, PublicKey } from 'https://esm.sh/@solana/web3.js@1.98.4';
-import { getTokenMetadata, TOKEN_2022_PROGRAM_ID } from 'https://esm.sh/@solana/spl-token@0.4.15';
+// ?deps= pins spl-token's own internal web3.js import to this exact same
+// version - without it, esm.sh can resolve spl-token's "^1.95.5" peer range
+// to a technically-different build than the one imported above, so the
+// PublicKey/Connection instances this page creates aren't `instanceof` the
+// same class spl-token's internals check against. That mismatch throws
+// immediately and silently (no visible error, the page just never starts),
+// since it happens at module-evaluation time, before startScan ever runs.
+import { getTokenMetadata, TOKEN_2022_PROGRAM_ID } from 'https://esm.sh/@solana/spl-token@0.4.15?deps=@solana/web3.js@1.98.4';
 
 const WALLET        = "CLTycZtfAzkyVb2YZY5ySKtQoJo89tHoEM1T6LaCveM4";
 const TOKEN_2022    = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"; // string form - used by the raw JSON-RPC calls below
